@@ -1,6 +1,6 @@
 defmodule LiveExWebRTC.Publisher do
   @moduledoc """
-  `Phoenix.LiveComponent` for sending audio and video via WebRTC from a browser to a Phoenix app (browser publishes).
+  Component for sending audio and video via WebRTC from a browser to a Phoenix app (browser publishes).
 
   It will render a view with:
   * audio and video device selects
@@ -42,36 +42,34 @@ defmodule LiveExWebRTC.Publisher do
   ## Examples
 
   ```elixir
-  <.live_component
-    module={LiveExWebRTC.Publisher}
-    id="publisher"
-    ice_servers={[%{urls: "stun:stun.l.google.com:19302"}]}
-  />
+  TODO
   ```
   """
   use Phoenix.LiveComponent
 
+  alias LiveExWebRTC.Publisher
   alias ExWebRTC.{ICECandidate, PeerConnection, SessionDescription}
+  alias Phoenix.PubSub
 
-  @typedoc """
-  Message sent to the `Phoenix.LiveView` after component's initialization.
+  defstruct id: nil,
+            pc: nil,
+            audio_track_id: nil,
+            video_track_id: nil,
+            on_packet: nil,
+            on_connected: nil,
+            pubsub: nil,
+            ice_servers: nil,
+            ice_ip_filter: nil,
+            ice_port_range: nil,
+            audio_codecs: nil,
+            video_codecs: nil,
+            name: nil
 
-  * `pc` - `ExWebRTC.PeerConnection`'s pid spawned by this live component
-  * `audio_track_id` - id of audio track
-  * `video_track_id` - id of video track
-  """
-  @type init_msg() ::
-          {:live_ex_webrtc,
-           %{
-             pc: pid(),
-             audio_track_id: String.t(),
-             video_track_id: String.t()
-           }}
+  attr(:publisher, __MODULE__, required: true)
 
-  @impl true
-  def render(assigns) do
+  def studio(assigns) do
     ~H"""
-    <div id={@id} phx-hook="Publisher" class="h-full w-full flex justify-between gap-6">
+    <div id={@publisher.id} phx-hook="Publisher" class="h-full w-full flex justify-between gap-6">
       <div class="w-full flex flex-col">
         <details>
           <summary class="font-bold text-[#0d0d0d] py-2.5">Devices</summary>
@@ -194,13 +192,90 @@ defmodule LiveExWebRTC.Publisher do
     """
   end
 
-  @impl true
-  def handle_event(_event, _unsigned_params, %{assigns: %{pc: nil}} = socket) do
-    {:noreply, socket}
+  def attach(socket, opts) do
+    opts =
+      Keyword.validate!(opts, [
+        :id,
+        :name,
+        :pubsub,
+        :on_packet,
+        :on_connected,
+        :ice_servers,
+        :ice_ip_filter,
+        :ice_port_range,
+        :audio_codecs,
+        :video_codecs
+      ])
+
+    publisher = %Publisher{
+      id: Keyword.fetch!(opts, :id),
+      pubsub: Keyword.fetch!(opts, :pubsub),
+      on_packet: Keyword.get(opts, :on_packet, fn _kind, _packet, sock -> sock end),
+      on_connected: Keyword.get(opts, :on_connected, fn sock -> sock end),
+      ice_servers: Keyword.get(opts, :ice_servers, [%{urls: "stun:stun.l.google.com:19302"}]),
+      ice_ip_filter: Keyword.get(opts, :ice_ip_filter),
+      ice_port_range: Keyword.get(opts, :ice_port_range),
+      audio_codecs: Keyword.get(opts, :audio_codecs),
+      video_codecs: Keyword.get(opts, :video_codecs),
+      name: Keyword.get(opts, :name)
+    }
+
+    socket
+    |> assign(publisher: publisher)
+    |> attach_hook(:publisher_infos, :handle_info, &attached_handle_info/2)
+    |> attach_hook(:publisher_events, :handle_event, &attached_handle_event/3)
   end
 
-  @impl true
-  def handle_event("offer", unsigned_params, socket) do
+  defp attached_handle_info({:live_ex_webrtc, :keyframe_req}, socket) do
+    %{publisher: publisher} = socket.assigns
+
+    if pc = publisher.pc do
+      :ok = PeerConnection.send_pli(pc, publisher.video_track_id)
+    end
+
+    {:halt, socket}
+  end
+
+  defp attached_handle_info({:ex_webrtc, _pc, {:rtp, track_id, nil, packet}}, socket) do
+    %{publisher: publisher} = socket.assigns
+
+    case publisher do
+      %Publisher{video_track_id: ^track_id} ->
+        PubSub.broadcast(
+          publisher.pubsub,
+          "streams:video:#{publisher.id}",
+          {:live_ex_webrtc, :video, packet}
+        )
+
+        %Phoenix.LiveView.Socket{} = new_socket = publisher.on_packet.(:video, packet, socket)
+        {:halt, new_socket}
+
+      %Publisher{audio_track_id: ^track_id} ->
+        PubSub.broadcast(
+          publisher.pubsub,
+          "streams:audio:#{publisher.id}",
+          {:live_ex_webrtc, :audio, packet}
+        )
+
+        %Phoenix.LiveView.Socket{} = new_socket = publisher.on_packet.(:audio, packet, socket)
+        {:halt, new_socket}
+    end
+  end
+
+  defp attached_handle_info({:ex_webrtc, _pid, {:connection_state_change, :connected}}, socket) do
+    %{publisher: pub} = socket.assigns
+    %Phoenix.LiveView.Socket{} = new_socket = pub.on_connected.(socket)
+    {:halt, new_socket}
+  end
+
+  defp attached_handle_info({:ex_webrtc, _, _}, socket) do
+    {:halt, socket}
+  end
+
+  defp attached_handle_info(_msg, socket), do: {:cont, socket}
+
+  defp attached_handle_event("offer", unsigned_params, socket) do
+    %{publisher: publisher} = socket.assigns
     offer = SessionDescription.from_json(unsigned_params)
     {:ok, pc} = spawn_peer_connection(socket)
 
@@ -211,51 +286,76 @@ defmodule LiveExWebRTC.Publisher do
       %{kind: :video, receiver: %{track: video_track}}
     ] = PeerConnection.get_transceivers(pc)
 
-    info = %{pc: pc, audio_track_id: audio_track.id, video_track_id: video_track.id}
-    send(self(), {:live_ex_webrtc, info})
-
     {:ok, answer} = PeerConnection.create_answer(pc)
     :ok = PeerConnection.set_local_description(pc, answer)
     :ok = gather_candidates(pc)
     answer = PeerConnection.get_local_description(pc)
 
-    socket = assign(socket, :pc, pc)
-    socket = push_event(socket, "answer-#{socket.assigns.id}", SessionDescription.to_json(answer))
+    # subscribe now that we are initialized
+    PubSub.subscribe(publisher.pubsub, "publishers:#{publisher.id}")
 
-    {:noreply, socket}
+    new_publisher = %Publisher{
+      publisher
+      | pc: pc,
+        audio_track_id: audio_track.id,
+        video_track_id: video_track.id
+    }
+
+    %Phoenix.LiveView.Socket{} = new_socket = new_publisher.on_connected.(socket)
+
+    {:halt,
+     new_socket
+     |> assign(publisher: new_publisher)
+     |> push_event("answer-#{publisher.id}", SessionDescription.to_json(answer))}
   end
 
-  @impl true
-  def handle_event("ice", "null", socket) do
-    :ok = PeerConnection.add_ice_candidate(socket.assigns.pc, %ICECandidate{candidate: ""})
-    {:noreply, socket}
+  defp attached_handle_event("ice", "null", socket) do
+    %{publisher: publisher} = socket.assigns
+
+    case publisher do
+      %Publisher{pc: nil} ->
+        {:halt, socket}
+
+      %Publisher{pc: pc} ->
+        :ok = PeerConnection.add_ice_candidate(pc, %ICECandidate{candidate: ""})
+        {:halt, socket}
+    end
   end
 
-  @impl true
-  def handle_event("ice", unsigned_params, socket) do
-    cand =
-      unsigned_params
-      |> Jason.decode!()
-      |> ExWebRTC.ICECandidate.from_json()
+  defp attached_handle_event("ice", unsigned_params, socket) do
+    %{publisher: publisher} = socket.assigns
 
-    :ok = PeerConnection.add_ice_candidate(socket.assigns.pc, cand)
+    case publisher do
+      %Publisher{pc: nil} ->
+        {:halt, socket}
 
-    {:noreply, socket}
+      %Publisher{pc: pc} ->
+        cand =
+          unsigned_params
+          |> Jason.decode!()
+          |> ExWebRTC.ICECandidate.from_json()
+
+        :ok = PeerConnection.add_ice_candidate(pc, cand)
+
+        {:halt, socket}
+    end
   end
 
   defp spawn_peer_connection(socket) do
+    %{publisher: publisher} = socket.assigns
+
     pc_opts =
       [
-        ice_servers: socket.assigns[:ice_servers],
-        ice_ip_filter: socket.assigns[:ice_ip_filter],
-        ice_port_range: socket.assigns[:ice_port_range],
-        audio_codecs: socket.assigns[:audio_codecs],
-        video_codecs: socket.assigns[:video_codecs]
+        ice_servers: publisher.ice_servers,
+        ice_ip_filter: publisher.ice_ip_filter,
+        ice_port_range: publisher.ice_port_range,
+        audio_codecs: publisher.audio_codecs,
+        video_codecs: publisher.video_codecs
       ]
       |> Enum.reject(fn {_k, v} -> v == nil end)
 
     gen_server_opts =
-      [name: socket.assigns[:gen_server_name]]
+      [name: publisher.name]
       |> Enum.reject(fn {_k, v} -> v == nil end)
 
     PeerConnection.start(pc_opts, gen_server_opts)
