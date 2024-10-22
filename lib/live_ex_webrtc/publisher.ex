@@ -53,6 +53,7 @@ defmodule LiveExWebRTC.Publisher do
 
   defstruct id: nil,
             pc: nil,
+            streaming?: false,
             audio_track_id: nil,
             video_track_id: nil,
             on_packet: nil,
@@ -66,6 +67,9 @@ defmodule LiveExWebRTC.Publisher do
             name: nil
 
   attr(:publisher, __MODULE__, required: true)
+
+  slot :start
+  slot :stop
 
   def studio(assigns) do
     ~H"""
@@ -178,13 +182,30 @@ defmodule LiveExWebRTC.Publisher do
           </div>
           </div>
         </div>
-        <div class="py-2.5">
+        <div :if={@publisher.streaming?} class="py-2.">
           <button
             id="lex-button"
             class="rounded-lg w-full px-2.5 py-2.5 bg-brand/100 disabled:bg-brand/50 hover:bg-brand/90 text-white font-bold"
-            disabled
+            phx-click="stop-streaming"
           >
-            Start streaming
+            <%= if @start == [] do %>
+              Stop streaming
+            <% else %>
+              <%= render_slot(@stop, []) %>
+            <% end %>
+          </button>
+        </div>
+        <div :if={!@publisher.streaming?} class="py-2.5">
+          <button
+            id="lex-button"
+            class="rounded-lg w-full px-2.5 py-2.5 bg-brand/100 disabled:bg-brand/50 hover:bg-brand/90 text-white font-bold"
+            phx-click="start-streaming"
+          >
+            <%= if @start == [] do %>
+              Start streaming
+            <% else %>
+              <%= render_slot(@start, []) %>
+            <% end %>
           </button>
         </div>
       </div>
@@ -273,6 +294,20 @@ defmodule LiveExWebRTC.Publisher do
   end
 
   defp attached_handle_info(_msg, socket), do: {:cont, socket}
+
+  defp attached_handle_event("start-streaming", _, socket) do
+    {:halt,
+     socket
+     |> assign(publisher: %Publisher{socket.assigns.publisher | streaming?: true})
+     |> push_event("start-streaming", %{})}
+  end
+
+  defp attached_handle_event("stop-streaming", _, socket) do
+    {:halt,
+     socket
+     |> assign(publisher: %Publisher{socket.assigns.publisher | streaming?: false})
+     |> push_event("stop-streaming", %{})}
+  end
 
   defp attached_handle_event("offer", unsigned_params, socket) do
     %{publisher: publisher} = socket.assigns
