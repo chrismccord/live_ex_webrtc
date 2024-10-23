@@ -3,8 +3,8 @@ export function createPublisherHook(iceServers = []) {
     async mounted() {
       const view = this;
 
-      view.handleEvent("start-streaming", () => view.startStreaming());
-      view.handleEvent("stop-streaming", () => view.stopStreaming());
+      view.handleEvent("start-streaming", () => view.startStreaming(view));
+      view.handleEvent("stop-streaming", () => view.stopStreaming(view));
 
       view.audioDevices = document.getElementById("lex-audio-devices");
       view.videoDevices = document.getElementById("lex-video-devices");

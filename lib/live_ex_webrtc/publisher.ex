@@ -45,7 +45,7 @@ defmodule LiveExWebRTC.Publisher do
   TODO
   ```
   """
-  use Phoenix.LiveComponent
+  use Phoenix.LiveView
 
   alias LiveExWebRTC.Publisher
   alias ExWebRTC.{ICECandidate, PeerConnection, SessionDescription}
@@ -66,12 +66,21 @@ defmodule LiveExWebRTC.Publisher do
             video_codecs: nil,
             name: nil
 
+  attr(:socket, Phoenix.LiveView.Socket, required: true)
   attr(:publisher, __MODULE__, required: true)
 
-  slot :start
-  slot :stop
-
   def studio(assigns) do
+    ~H"""
+    <%= live_render(@socket, __MODULE__, id: @publisher.id, session: %{"publisher_id" => @publisher.id}) %>
+    """
+  end
+
+  def render(%{publisher: nil} = assigns) do
+    ~H"""
+    """
+  end
+
+  def render(assigns) do
     ~H"""
     <div id={@publisher.id} phx-hook="Publisher" class="h-full w-full flex justify-between gap-6">
       <div class="w-full flex flex-col">
@@ -188,11 +197,7 @@ defmodule LiveExWebRTC.Publisher do
             class="rounded-lg w-full px-2.5 py-2.5 bg-brand/100 disabled:bg-brand/50 hover:bg-brand/90 text-white font-bold"
             phx-click="stop-streaming"
           >
-            <%= if @start == [] do %>
-              Stop streaming
-            <% else %>
-              <%= render_slot(@stop, []) %>
-            <% end %>
+            Stop streaming
           </button>
         </div>
         <div :if={!@publisher.streaming?} class="py-2.5">
@@ -201,16 +206,32 @@ defmodule LiveExWebRTC.Publisher do
             class="rounded-lg w-full px-2.5 py-2.5 bg-brand/100 disabled:bg-brand/50 hover:bg-brand/90 text-white font-bold"
             phx-click="start-streaming"
           >
-            <%= if @start == [] do %>
-              Start streaming
-            <% else %>
-              <%= render_slot(@start, []) %>
-            <% end %>
+            Start streaming
           </button>
         </div>
       </div>
     </div>
     """
+  end
+
+  def mount(_params, %{"publisher_id" => pub_id}, socket) do
+    socket = assign(socket, publisher: nil)
+
+    if connected?(socket) do
+      ref = make_ref()
+      send(socket.parent_pid, {__MODULE__, {:attached, ref, self(), %{publisher_id: pub_id}}})
+
+      socket =
+        receive do
+          {^ref, %Publisher{id: ^pub_id} = publisher} -> assign(socket, publisher: publisher)
+        after
+          5000 -> exit(:timeout)
+        end
+
+      {:ok, socket}
+    else
+      {:ok, socket}
+    end
   end
 
   def attach(socket, opts) do
@@ -231,8 +252,8 @@ defmodule LiveExWebRTC.Publisher do
     publisher = %Publisher{
       id: Keyword.fetch!(opts, :id),
       pubsub: Keyword.fetch!(opts, :pubsub),
-      on_packet: Keyword.get(opts, :on_packet, fn _kind, _packet, sock -> sock end),
-      on_connected: Keyword.get(opts, :on_connected, fn sock -> sock end),
+      on_packet: Keyword.get(opts, :on_packet),
+      on_connected: Keyword.get(opts, :on_connected),
       ice_servers: Keyword.get(opts, :ice_servers, [%{urls: "stun:stun.l.google.com:19302"}]),
       ice_ip_filter: Keyword.get(opts, :ice_ip_filter),
       ice_port_range: Keyword.get(opts, :ice_port_range),
@@ -244,20 +265,19 @@ defmodule LiveExWebRTC.Publisher do
     socket
     |> assign(publisher: publisher)
     |> attach_hook(:publisher_infos, :handle_info, &attached_handle_info/2)
-    |> attach_hook(:publisher_events, :handle_event, &attached_handle_event/3)
   end
 
-  defp attached_handle_info({:live_ex_webrtc, :keyframe_req}, socket) do
+  def handle_info({:live_ex_webrtc, :keyframe_req}, socket) do
     %{publisher: publisher} = socket.assigns
 
     if pc = publisher.pc do
       :ok = PeerConnection.send_pli(pc, publisher.video_track_id)
     end
 
-    {:halt, socket}
+    {:noreply, socket}
   end
 
-  defp attached_handle_info({:ex_webrtc, _pc, {:rtp, track_id, nil, packet}}, socket) do
+  def handle_info({:ex_webrtc, _pc, {:rtp, track_id, nil, packet}}, socket) do
     %{publisher: publisher} = socket.assigns
 
     case publisher do
@@ -268,8 +288,8 @@ defmodule LiveExWebRTC.Publisher do
           {:live_ex_webrtc, :video, packet}
         )
 
-        %Phoenix.LiveView.Socket{} = new_socket = publisher.on_packet.(:video, packet, socket)
-        {:halt, new_socket}
+        if publisher.on_packet, do: publisher.on_packet.(publisher.id, :video, packet, socket)
+        {:noreply, socket}
 
       %Publisher{audio_track_id: ^track_id} ->
         PubSub.broadcast(
@@ -278,38 +298,45 @@ defmodule LiveExWebRTC.Publisher do
           {:live_ex_webrtc, :audio, packet}
         )
 
-        %Phoenix.LiveView.Socket{} = new_socket = publisher.on_packet.(:audio, packet, socket)
-        {:halt, new_socket}
+        if publisher.on_packet, do: publisher.on_packet.(publisher.id, :audio, packet, socket)
+        {:noreply, socket}
     end
   end
 
-  defp attached_handle_info({:ex_webrtc, _pid, {:connection_state_change, :connected}}, socket) do
+  def handle_info({:ex_webrtc, _pid, {:connection_state_change, :connected}}, socket) do
     %{publisher: pub} = socket.assigns
-    %Phoenix.LiveView.Socket{} = new_socket = pub.on_connected.(socket)
-    {:halt, new_socket}
+    if pub.on_connected, do: pub.on_connected.(pub.id)
+    {:noreply, socket}
   end
 
-  defp attached_handle_info({:ex_webrtc, _, _}, socket) do
+  def handle_info({:ex_webrtc, _, _}, socket) do
+    {:noreply, socket}
+  end
+
+  defp attached_handle_info({__MODULE__, {:attached, ref, pid, _meta}}, socket) do
+    send(pid, {ref, socket.assigns.publisher})
     {:halt, socket}
   end
 
-  defp attached_handle_info(_msg, socket), do: {:cont, socket}
+  defp attached_handle_info(_msg, socket) do
+    {:cont, socket}
+  end
 
-  defp attached_handle_event("start-streaming", _, socket) do
-    {:halt,
+  def handle_event("start-streaming", _, socket) do
+    {:noreply,
      socket
      |> assign(publisher: %Publisher{socket.assigns.publisher | streaming?: true})
      |> push_event("start-streaming", %{})}
   end
 
-  defp attached_handle_event("stop-streaming", _, socket) do
-    {:halt,
+  def handle_event("stop-streaming", _, socket) do
+    {:noreply,
      socket
      |> assign(publisher: %Publisher{socket.assigns.publisher | streaming?: false})
      |> push_event("stop-streaming", %{})}
   end
 
-  defp attached_handle_event("offer", unsigned_params, socket) do
+  def handle_event("offer", unsigned_params, socket) do
     %{publisher: publisher} = socket.assigns
     offer = SessionDescription.from_json(unsigned_params)
     {:ok, pc} = spawn_peer_connection(socket)
@@ -336,33 +363,31 @@ defmodule LiveExWebRTC.Publisher do
         video_track_id: video_track.id
     }
 
-    %Phoenix.LiveView.Socket{} = new_socket = new_publisher.on_connected.(socket)
-
-    {:halt,
-     new_socket
+    {:noreply,
+     socket
      |> assign(publisher: new_publisher)
      |> push_event("answer-#{publisher.id}", SessionDescription.to_json(answer))}
   end
 
-  defp attached_handle_event("ice", "null", socket) do
+  def handle_event("ice", "null", socket) do
     %{publisher: publisher} = socket.assigns
 
     case publisher do
       %Publisher{pc: nil} ->
-        {:halt, socket}
+        {:noreply, socket}
 
       %Publisher{pc: pc} ->
         :ok = PeerConnection.add_ice_candidate(pc, %ICECandidate{candidate: ""})
-        {:halt, socket}
+        {:noreply, socket}
     end
   end
 
-  defp attached_handle_event("ice", unsigned_params, socket) do
+  def handle_event("ice", unsigned_params, socket) do
     %{publisher: publisher} = socket.assigns
 
     case publisher do
       %Publisher{pc: nil} ->
-        {:halt, socket}
+        {:noreply, socket}
 
       %Publisher{pc: pc} ->
         cand =
@@ -372,7 +397,7 @@ defmodule LiveExWebRTC.Publisher do
 
         :ok = PeerConnection.add_ice_candidate(pc, cand)
 
-        {:halt, socket}
+        {:noreply, socket}
     end
   end
 

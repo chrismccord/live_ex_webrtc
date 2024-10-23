@@ -52,7 +52,7 @@ defmodule LiveExWebRTC.Subscriber do
   />
   ```
   """
-  use Phoenix.LiveComponent
+  use Phoenix.LiveView
 
   alias LiveExWebRTC.Subscriber
 
@@ -75,12 +75,16 @@ defmodule LiveExWebRTC.Subscriber do
   alias ExRTCP.Packet.PayloadFeedback.PLI
   alias Phoenix.PubSub
 
+  attr(:socket, Phoenix.LiveView.Socket, required: true)
   attr(:subscriber, __MODULE__, required: true)
   attr(:class, :string, default: nil)
 
   def stream_viewer(assigns) do
     ~H"""
-    <video id={@subscriber.id} phx-hook="Subscriber" class={@class} controls autoplay muted></video>
+    <%= live_render(@socket, __MODULE__, id: @subscriber.id, session: %{
+      "publisher_id" => @subscriber.publisher_id,
+      "class" => @class
+    }) %>
     """
   end
 
@@ -104,8 +108,8 @@ defmodule LiveExWebRTC.Subscriber do
       id: Keyword.fetch!(opts, :id),
       publisher_id: Keyword.fetch!(opts, :publisher_id),
       pubsub: Keyword.fetch!(opts, :pubsub),
-      on_packet: Keyword.get(opts, :on_packet, fn _kind, _packet, sock -> sock end),
-      on_connected: Keyword.get(opts, :on_connected, fn sock -> sock end),
+      on_packet: Keyword.get(opts, :on_packet),
+      on_connected: Keyword.get(opts, :on_connected),
       ice_servers: Keyword.get(opts, :ice_servers, [%{urls: "stun:stun.l.google.com:19302"}]),
       ice_ip_filter: Keyword.get(opts, :ice_ip_filter),
       ice_port_range: Keyword.get(opts, :ice_port_range),
@@ -117,54 +121,88 @@ defmodule LiveExWebRTC.Subscriber do
     socket
     |> assign(subscriber: subscriber)
     |> attach_hook(:subscriber_infos, :handle_info, &attached_handle_info/2)
-    |> attach_hook(:subscriber_events, :handle_event, &attached_handle_event/3)
   end
 
-  defp attached_handle_info({:ex_webrtc, _pid, {:connection_state_change, :connected}}, socket) do
+  def render(%{subscriber: nil} = assigns) do
+    ~H"""
+    """
+  end
+
+  def render(assigns) do
+    ~H"""
+    <video id={@subscriber.id} phx-hook="Subscriber" class={@class} controls autoplay muted></video>
+    """
+  end
+
+  def mount(_params, %{"publisher_id" => pub_id, "class" => class}, socket) do
+    socket = assign(socket, class: class, subscriber: nil)
+
+    if connected?(socket) do
+      ref = make_ref()
+      send(socket.parent_pid, {__MODULE__, {:attached, ref, self(), %{publisher_id: pub_id}}})
+
+      socket =
+        receive do
+          {^ref, %Subscriber{publisher_id: ^pub_id} = subscriber} ->
+            assign(socket, subscriber: subscriber)
+        after
+          5000 -> exit(:timeout)
+        end
+
+      {:ok, socket}
+    else
+      {:ok, socket}
+    end
+  end
+
+  def handle_info({:ex_webrtc, _pid, {:connection_state_change, :connected}}, socket) do
     %{subscriber: sub} = socket.assigns
     PubSub.subscribe(sub.pubsub, "streams:audio:#{sub.publisher_id}")
     PubSub.subscribe(sub.pubsub, "streams:video:#{sub.publisher_id}")
     broadcast_keyframe_req(socket)
-    %Phoenix.LiveView.Socket{} = new_socket = sub.on_connected.(socket)
-    {:halt, new_socket}
+    if sub.on_connected, do: sub.on_connected.(sub.publisher_id)
+
+    {:noreply, socket}
   end
 
-  defp attached_handle_info({:ex_webrtc, _pc, {:rtcp, packets}}, socket) do
+  def handle_info({:ex_webrtc, _pc, {:rtcp, packets}}, socket) do
     # Browser, we are sending to, requested a keyframe.
     # Forward this request to the publisher.
     if Enum.any?(packets, fn {_, packet} -> match?(%PLI{}, packet) end) do
       broadcast_keyframe_req(socket)
     end
 
-    {:halt, socket}
+    {:noreply, socket}
   end
 
-  defp attached_handle_info({:live_ex_webrtc, :audio, packet}, socket) do
+  def handle_info({:ex_webrtc, _pid, _}, socket) do
+    {:noreply, socket}
+  end
+
+  def handle_info({:live_ex_webrtc, :audio, packet}, socket) do
     %{subscriber: sub} = socket.assigns
     PeerConnection.send_rtp(sub.pc, sub.audio_track_id, packet)
-    {:halt, sub.on_packet.(:audio, packet, socket)}
+    if sub.on_packet, do: sub.on_packet.(sub.publisher_id, :audio, packet)
+    {:noreply, socket}
   end
 
-  defp attached_handle_info({:live_ex_webrtc, :video, packet}, socket) do
+  def handle_info({:live_ex_webrtc, :video, packet}, socket) do
     %{subscriber: sub} = socket.assigns
     PeerConnection.send_rtp(sub.pc, sub.video_track_id, packet)
-    {:halt, sub.on_packet.(:video, packet, socket)}
+    if sub.on_packet, do: sub.on_packet.(sub.publisher_id, :video, packet)
+    {:noreply, socket}
+  end
+
+  defp attached_handle_info({__MODULE__, {:attached, ref, pid, _meta}}, socket) do
+    send(pid, {ref, socket.assigns.subscriber})
+    {:halt, socket}
   end
 
   defp attached_handle_info(_msg, socket) do
     {:cont, socket}
   end
 
-  # defp attached_handle_event(
-  #        event,
-  #        _unsigned_params,
-  #        %{assigns: %{subscriber: %Subscriber{pc: nil}}} = socket
-  #      )
-  #      when event in ["offer", "ice"] do
-  #   {:halt, socket}
-  # end
-
-  defp attached_handle_event("offer", unsigned_params, socket) do
+  def handle_event("offer", unsigned_params, socket) do
     %{subscriber: sub} = socket.assigns
 
     offer = SessionDescription.from_json(unsigned_params)
@@ -189,31 +227,31 @@ defmodule LiveExWebRTC.Subscriber do
         video_track_id: video_track.id
     }
 
-    {:halt,
+    {:noreply,
      socket
      |> assign(subscriber: new_sub)
      |> push_event("answer-#{sub.id}", SessionDescription.to_json(answer))}
   end
 
-  defp attached_handle_event("ice", "null", socket) do
+  def handle_event("ice", "null", socket) do
     %{subscriber: sub} = socket.assigns
 
     case sub do
       %Subscriber{pc: nil} ->
-        {:halt, socket}
+        {:noreply, socket}
 
       %Subscriber{pc: pc} ->
         :ok = PeerConnection.add_ice_candidate(pc, %ICECandidate{candidate: ""})
-        {:halt, socket}
+        {:noreply, socket}
     end
   end
 
-  defp attached_handle_event("ice", unsigned_params, socket) do
+  def handle_event("ice", unsigned_params, socket) do
     %{subscriber: sub} = socket.assigns
 
     case sub do
       %Subscriber{pc: nil} ->
-        {:halt, socket}
+        {:noreply, socket}
 
       %Subscriber{pc: pc} ->
         cand =
@@ -223,12 +261,8 @@ defmodule LiveExWebRTC.Subscriber do
 
         :ok = PeerConnection.add_ice_candidate(pc, cand)
 
-        {:halt, socket}
+        {:noreply, socket}
     end
-  end
-
-  defp attached_handle_event(_, _, socket) do
-    {:cont, socket}
   end
 
   defp spawn_peer_connection(socket) do
